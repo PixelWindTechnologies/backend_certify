@@ -6,11 +6,13 @@ from sqlalchemy.orm import Session
 import io
 
 from app.api.deps import get_current_user, require_super_admin
+from app.core.config import settings
 from app.core.security import hash_password
 from app.db.database import get_db
 from app.models.models import College, Student, User, UserRole, Enrollment
 from app.schemas.schemas import StudentCreate, StudentOut, StudentUpdate, ImportReport, AdminResetPasswordResponse
 from app.services.audit import record
+from app.services.email_service import send_student_import_notification
 from app.services.excel_service import build_template_workbook, process_import, default_password_for_phone
 
 router = APIRouter(prefix="/students", tags=["students"])
@@ -65,6 +67,15 @@ def import_students(
 ):
     report = process_import(db, college_id, file.file.read())
     record(db, user.id, "STUDENTS_IMPORTED", "Student", None, None, {"success": report["success_count"], "failed": report["failure_count"]})
+
+    college = db.query(College).filter(College.id == college_id).first()
+    if college and college.contact_email and report["success_count"]:
+        send_student_import_notification(
+            college.contact_email,
+            college.name,
+            report["success_count"],
+            f"{settings.FRONTEND_ORIGIN}/login",
+        )
     return report
 
 

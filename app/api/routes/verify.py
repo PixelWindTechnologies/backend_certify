@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
@@ -50,4 +52,5 @@ def verify_certificate(certificate_id: str, request: Request, db: Session = Depe
         certificate_id=cert.id,
         issue_date=cert.issue_date,
         issued_by=settings.ISSUER_NAME or "Pixelwind Technologies",
+        verified_at=datetime.utcnow(),
     )

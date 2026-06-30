@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     LOCAL_STORAGE_PATH: str = "./storage"
     S3_BUCKET: str = ""
     S3_ENDPOINT_URL: str = ""
+    S3_PUBLIC_URL: str = ""
     S3_ACCESS_KEY: str = ""
     S3_SECRET_KEY: str = ""
     S3_REGION: str = "auto"
@@ -39,6 +40,15 @@ class Settings(BaseSettings):
     VERIFICATION_BASE_URL: str = "https://verify.pixelwind.in"
     ISSUER_NAME: str = "Pixelwind Technologies"
     ISSUER_BRANCH: str = ""
+
+    # Email / SMTP
+    EMAIL_ENABLED: bool = False
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM_EMAIL: str = ""
+    SMTP_FROM_NAME: str = "Pixelwind"
 
     # Certificate job
     CERTIFICATE_JOB_INTERVAL_SECONDS: int = 60

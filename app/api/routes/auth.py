@@ -3,22 +3,26 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import (
     verify_password,
     create_access_token,
     create_refresh_token,
     decode_token,
     hash_password,
+    create_password_reset_token,
 )
 from app.api.deps import get_current_user
 from app.db.database import get_db
 from app.models.models import User
+from app.services.email_service import send_password_reset_email
 from app.schemas.schemas import (
     LoginRequest,
     TokenResponse,
     RefreshRequest,
     ResetPasswordRequest,
     ChangePasswordRequest,
+    ForgotPasswordRequest,
 )
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -70,6 +74,18 @@ def refresh(payload: RefreshRequest, db: Session = Depends(get_db)):
         user_id=user.id,
         must_change_password=user.must_change_password,
     )
+
+
+@router.post("/forgot-password")
+def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user:
+        return {"message": "If an account exists for this email, a reset link has been sent."}
+
+    token = create_password_reset_token(user.id)
+    reset_url = f"{settings.FRONTEND_ORIGIN}/reset-password?token={token}"
+    send_password_reset_email(user.email, reset_url)
+    return {"message": "If an account exists for this email, a reset link has been sent."}
 
 
 @router.post("/change-password")

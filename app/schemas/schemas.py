@@ -37,6 +37,10 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+
 class AdminResetPasswordResponse(BaseModel):
     temporary_password: str
     must_change_password: bool = True
@@ -234,6 +238,7 @@ class VerificationResponse(BaseModel):
     certificate_id: str
     issue_date: date
     issued_by: str = "Pixelwind Technologies"
+    verified_at: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------

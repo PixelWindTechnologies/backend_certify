@@ -5,6 +5,8 @@ from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.services.certificate_engine import render_certificate_pdf
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.db.database import Base
@@ -54,3 +56,28 @@ def test_finalize_enrollment_if_eligible_marks_completed_and_approved_when_relie
         assert enrollment.certificate_approval == CertificateApproval.APPROVED
     finally:
         db.close()
+
+
+def test_render_certificate_pdf_accepts_aicte_id(tmp_path):
+    output_path = tmp_path / "certificate.pdf"
+    result_path = render_certificate_pdf(
+        output_path=str(output_path),
+        student_name="Test Student",
+        father_name="Test Father",
+        college_name="Test College",
+        course_name="Test Course",
+        internship_id="INT-001",
+        certificate_id="cert-1",
+        issue_date="2026-06-29",
+        performance_grade="A",
+        admission_date="2026-01-01",
+        relieving_date="2026-06-01",
+        template_bg_path=None,
+        signature_path=None,
+        gender="male",
+        aicte_internship_id="AICTE-123",
+    )
+
+    assert result_path == str(output_path)
+    assert output_path.exists()
+    assert output_path.stat().st_size > 0

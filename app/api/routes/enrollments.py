@@ -28,6 +28,7 @@ from app.models.models import (
 from app.schemas.schemas import EnrollmentCreate, EnrollmentOut, EnrollmentUpdate
 from app.services.audit import record
 from app.services.certificate_job import finalize_enrollment_if_eligible
+from app.services.storage import resolve_storage_path
 from app.services.internship_id import build_internship_id, next_student_sequence
 
 router = APIRouter(prefix="/enrollments", tags=["enrollments"])
@@ -158,7 +159,7 @@ def delete_enrollment(enrollment_id: str, db: Session = Depends(get_db), user: U
         # Remove stored artifact files too.
         for path_value in (certificate.pdf_path, certificate.qr_code_path):
             if path_value:
-                full_path = Path(settings.LOCAL_STORAGE_PATH) / path_value
+                full_path = resolve_storage_path(path_value)
                 if full_path.exists():
                     try:
                         full_path.unlink()

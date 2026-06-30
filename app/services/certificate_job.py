@@ -20,6 +20,7 @@ to Completed so the Enrollments page reflects reality.
 endpoint so "preview" and "generate" always produce an identical document —
 the only difference is whether a Certificate row gets persisted.
 """
+import re
 from datetime import date
 from pathlib import Path
 
@@ -37,7 +38,9 @@ from app.models.models import (
     Signature,
 )
 from app.services.certificate_engine import render_certificate_pdf
+from app.services.email_service import send_certificate_ready_email, send_certificate_generation_failure_alert
 from app.services.qr_engine import generate_qr_for_certificate
+from app.services.storage import resolve_storage_path
 
 
 def finalize_enrollment_if_eligible(db: Session, enrollment: Enrollment) -> bool:
@@ -83,7 +86,7 @@ def render_certificate_for_enrollment(
     # The built-in layout never draws this; the custom-background layout
     # (PixelWind's branded template) does. Generating it is cheap either way.
     qr_relative_path = generate_qr_for_certificate(certificate_id)
-    qr_absolute_path = str(Path(settings.LOCAL_STORAGE_PATH) / qr_relative_path)
+    qr_absolute_path = str(resolve_storage_path(qr_relative_path))
 
     return render_certificate_pdf(
         output_path=output_path,
@@ -98,12 +101,19 @@ def render_certificate_for_enrollment(
         performance_grade=enrollment.performance_grade,
         admission_date=enrollment.admission_date.isoformat() if enrollment.admission_date else None,
         relieving_date=enrollment.relieving_date.isoformat() if enrollment.relieving_date else None,
-        template_bg_path=str(Path(settings.LOCAL_STORAGE_PATH) / template.file_path) if template else None,
-        signature_path=str(Path(settings.LOCAL_STORAGE_PATH) / signature.image_path) if signature else None,
+        template_bg_path=str(resolve_storage_path(template.file_path)) if template else None,
+        signature_path=str(resolve_storage_path(signature.image_path)) if signature else None,
         gender=student.gender,
         training_type=enrollment.training_type.value if enrollment.training_type else None,
         qr_code_path=qr_absolute_path,
     )
+
+
+def _slugify(value: str | None) -> str:
+    if not value:
+        return "student"
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return slug or "student"
 
 
 def generate_pending_certificates() -> int:
@@ -126,31 +136,49 @@ def generate_pending_certificates() -> int:
         ).all()
 
         for enrollment in eligible:
-            if not finalize_enrollment_if_eligible(db, enrollment):
+            try:
+                if not finalize_enrollment_if_eligible(db, enrollment):
+                    db.flush()
+
+                if enrollment.status != EnrollmentStatus.COMPLETED or enrollment.certificate_approval != CertificateApproval.APPROVED:
+                    continue
+
+                certificate = Certificate(enrollment_id=enrollment.id)
+                db.add(certificate)
                 db.flush()
 
-            if enrollment.status != EnrollmentStatus.COMPLETED or enrollment.certificate_approval != CertificateApproval.APPROVED:
+                template = db.query(CertificateTemplate).filter(CertificateTemplate.is_active.is_(True)).first()
+                student_name = _slugify(enrollment.student.full_name) if enrollment.student else "student"
+                pdf_relative_path = f"certificates/{student_name}-{certificate.id}.pdf"
+                pdf_absolute_path = str(resolve_storage_path(pdf_relative_path))
+
+                render_certificate_for_enrollment(
+                    db,
+                    enrollment,
+                    pdf_absolute_path,
+                    certificate.id,
+                    certificate.issue_date.isoformat(),
+                )
+
+                certificate.pdf_path = pdf_relative_path
+                certificate.template_id = template.id if template else None
+                generated += 1
+
+                if enrollment.student and enrollment.student.email:
+                    verification_url = f"{settings.FRONTEND_ORIGIN}/verify/{certificate.id}"
+                    send_certificate_ready_email(
+                        enrollment.student.email,
+                        enrollment.student.full_name,
+                        certificate.id,
+                        verification_url,
+                    )
+            except Exception as exc:
+                send_certificate_generation_failure_alert(
+                    [settings.FIRST_SUPER_ADMIN_EMAIL],
+                    enrollment.id,
+                    str(exc),
+                )
                 continue
-
-            certificate = Certificate(enrollment_id=enrollment.id)
-            db.add(certificate)
-            db.flush()
-
-            template = db.query(CertificateTemplate).filter(CertificateTemplate.is_active.is_(True)).first()
-            pdf_relative_path = f"certificates/{certificate.id}.pdf"
-            pdf_absolute_path = str(Path(settings.LOCAL_STORAGE_PATH) / pdf_relative_path)
-
-            render_certificate_for_enrollment(
-                db,
-                enrollment,
-                pdf_absolute_path,
-                certificate.id,
-                certificate.issue_date.isoformat(),
-            )
-
-            certificate.pdf_path = pdf_relative_path
-            certificate.template_id = template.id if template else None
-            generated += 1
 
         db.commit()
     finally:

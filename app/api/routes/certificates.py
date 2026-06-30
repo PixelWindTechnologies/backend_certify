@@ -1,10 +1,14 @@
-from datetime import datetime
-from pathlib import Path
+import io
+import re
 import tempfile
+import zipfile
+from datetime import datetime, date
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, require_college_admin, require_super_admin
@@ -22,14 +26,26 @@ from app.models.models import (
 from app.schemas.schemas import CertificateOut, CertificateRevokeRequest
 from app.services.audit import record
 from app.services.certificate_job import generate_pending_certificates, render_certificate_for_enrollment
+from app.services.storage import resolve_storage_path
 
 router = APIRouter(prefix="/certificates", tags=["certificates"])
+
+
+def build_certificate_download_filename(certificate: Certificate) -> str:
+    student_name = "student"
+    if certificate.enrollment and certificate.enrollment.student:
+        student_name = re.sub(r"[^a-zA-Z0-9]+", "-", certificate.enrollment.student.full_name or "student").strip("-").lower() or "student"
+    safe_id = str(certificate.id).replace("/", "-")
+    return f"{student_name}-{safe_id}.pdf"
 
 
 @router.get("", response_model=list[CertificateOut])
 def list_certificates(
     page: int = 1,
     page_size: int = 20,
+    search: str | None = Query(None),
+    issued_from: str | None = Query(None),
+    issued_to: str | None = Query(None),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -40,6 +56,17 @@ def list_certificates(
         from app.models.models import Student
 
         query = query.join(Student).filter(Student.user_id == user.id)
+    if search:
+        query = query.join(Enrollment.student).filter(
+            or_(
+                Enrollment.internship_id.ilike(f"%{search}%"),
+                Certificate.id.ilike(f"%{search}%"),
+            )
+        )
+    if issued_from:
+        query = query.filter(Certificate.issue_date >= datetime.strptime(issued_from, "%Y-%m-%d").date())
+    if issued_to:
+        query = query.filter(Certificate.issue_date <= datetime.strptime(issued_to, "%Y-%m-%d").date())
     total = query.count()
     items = query.order_by(Certificate.created_at.desc()).offset((page - 1) * page_size).limit(page_size).all()
     return JSONResponse(content=jsonable_encoder(items), headers={"X-Total-Count": str(total)})
@@ -79,10 +106,62 @@ def download_certificate(certificate_id: str, db: Session = Depends(get_db), use
     cert = db.query(Certificate).filter(Certificate.id == certificate_id).first()
     if not cert or not cert.pdf_path:
         raise HTTPException(status_code=404, detail="Certificate PDF not available")
-    full_path = Path(settings.LOCAL_STORAGE_PATH) / cert.pdf_path
+    full_path = resolve_storage_path(cert.pdf_path)
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="Certificate file missing on storage")
-    return FileResponse(full_path, media_type="application/pdf", filename=f"{certificate_id}.pdf")
+    filename = build_certificate_download_filename(cert)
+    return FileResponse(full_path, media_type="application/pdf", filename=filename)
+
+
+@router.get("/download-bulk")
+def download_certificates_zip(
+    db: Session = Depends(get_db),
+    user: User = Depends(require_super_admin),
+    college_id: str | None = Query(None),
+    course_id: str | None = Query(None),
+    issued_from: str | None = Query(None),
+    issued_to: str | None = Query(None),
+    search: str | None = Query(None),
+):
+    query = db.query(Certificate).join(Enrollment)
+    if college_id:
+        query = query.filter(Enrollment.college_id == college_id)
+    if course_id:
+        query = query.filter(Enrollment.course_id == course_id)
+    if issued_from:
+        query = query.filter(Certificate.issue_date >= datetime.strptime(issued_from, "%Y-%m-%d").date())
+    if issued_to:
+        query = query.filter(Certificate.issue_date <= datetime.strptime(issued_to, "%Y-%m-%d").date())
+    if search:
+        query = query.join(Enrollment.student).filter(
+            or_(
+                Enrollment.internship_id.ilike(f"%{search}%"),
+                Certificate.id.ilike(f"%{search}%"),
+            )
+        )
+
+    certificates = query.order_by(Certificate.created_at.desc()).all()
+
+    if not certificates:
+        raise HTTPException(status_code=404, detail="No certificates found")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for cert in certificates:
+            if not cert.pdf_path:
+                continue
+            full_path = resolve_storage_path(cert.pdf_path)
+            if not full_path.exists():
+                continue
+            filename = build_certificate_download_filename(cert)
+            zf.write(full_path, arcname=filename)
+
+    buffer.seek(0)
+    return StreamingResponse(
+        buffer,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=certificates.zip"},
+    )
 
 
 @router.post("/{certificate_id}/revoke", response_model=CertificateOut)
@@ -126,7 +205,7 @@ def upload_template(
     user: User = Depends(require_super_admin),
 ):
     relative_path = f"templates/{file.filename}"
-    full_path = Path(settings.LOCAL_STORAGE_PATH) / relative_path
+    full_path = resolve_storage_path(relative_path)
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_bytes(file.file.read())
 
@@ -171,7 +250,7 @@ def upload_signature(
     user: User = Depends(require_super_admin),
 ):
     relative_path = f"signatures/{file.filename}"
-    full_path = Path(settings.LOCAL_STORAGE_PATH) / relative_path
+    full_path = resolve_storage_path(relative_path)
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_bytes(file.file.read())
 
@@ -197,7 +276,7 @@ def preview_signature(signature_id: str, db: Session = Depends(get_db), user: Us
     signature = db.query(Signature).filter(Signature.id == signature_id).first()
     if not signature:
         raise HTTPException(status_code=404, detail="Signature not found")
-    full_path = Path(settings.LOCAL_STORAGE_PATH) / signature.image_path
+    full_path = resolve_storage_path(signature.image_path)
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="Signature file missing on storage")
     return FileResponse(full_path)
