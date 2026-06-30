@@ -23,9 +23,10 @@ the only difference is whether a Certificate row gets persisted.
 Storage note: ReportLab/PIL need real local file handles to render from
 (background template, signature image, QR code) and to render TO (the
 output PDF). So every render happens on local disk first; remote upload
-(S3/R2) is a separate, explicit step afterward. Nothing here assumes
-`resolve_storage_path` magically resolves to an existing file when
-STORAGE_BACKEND is s3/r2 — see app/services/storage.py.
+(S3/R2) is a separate, explicit step afterward. The background template
+and signature image are fetched to a guaranteed-real local temp file via
+resolve_to_local_temp() — they are NOT assumed to already exist on local
+disk just because resolve_storage_path() can compute a path for them.
 """
 import os
 import re
@@ -48,7 +49,12 @@ from app.models.models import (
 from app.services.certificate_engine import render_certificate_pdf
 from app.services.email_service import send_certificate_ready_email, send_certificate_generation_failure_alert
 from app.services.qr_engine import generate_qr_for_certificate
-from app.services.storage import get_storage, resolve_storage_path
+from app.services.storage import (
+    get_storage,
+    resolve_storage_path,
+    resolve_to_local_temp,
+    LocalStorage,
+)
 
 
 def finalize_enrollment_if_eligible(db: Session, enrollment: Enrollment) -> bool:
@@ -92,11 +98,17 @@ def render_certificate_for_enrollment(
     course = enrollment.course
     college = enrollment.college
 
-    # The built-in layout never draws this; the custom-background layout
-    # (PixelWind's branded template) does. Generating it is cheap either way.
     # qr_local_path is a guaranteed-real local file for rendering, regardless
     # of storage backend; qr_relative_path is the durable storage key.
     qr_local_path, qr_relative_path = generate_qr_for_certificate(certificate_id)
+
+    # Same treatment as the QR code: fetch the template/signature to a
+    # guaranteed-real local path. For LocalStorage this is just the real
+    # file already on disk. For S3/R2 this downloads the bytes to a fresh
+    # local temp file, since resolve_storage_path() alone only computes a
+    # path string and does NOT guarantee the file exists locally.
+    template_local_path = resolve_to_local_temp(template.file_path) if template else None
+    signature_local_path = resolve_to_local_temp(signature.image_path) if signature else None
 
     try:
         return render_certificate_pdf(
@@ -112,8 +124,8 @@ def render_certificate_for_enrollment(
             performance_grade=enrollment.performance_grade,
             admission_date=enrollment.admission_date.isoformat() if enrollment.admission_date else None,
             relieving_date=enrollment.relieving_date.isoformat() if enrollment.relieving_date else None,
-            template_bg_path=str(resolve_storage_path(template.file_path)) if template else None,
-            signature_path=str(resolve_storage_path(signature.image_path)) if signature else None,
+            template_bg_path=template_local_path,
+            signature_path=signature_local_path,
             gender=student.gender,
             training_type=enrollment.training_type.value if enrollment.training_type else None,
             qr_code_path=qr_local_path,
@@ -125,6 +137,19 @@ def render_certificate_for_enrollment(
             os.unlink(qr_local_path)
         except OSError:
             pass
+
+        # Only clean up template/signature local paths if storage is remote.
+        # For LocalStorage, template_local_path/signature_local_path point
+        # at the REAL stored files — deleting them would destroy the
+        # original template/signature, not just a temp copy.
+        storage = get_storage()
+        if not isinstance(storage, LocalStorage):
+            for temp_path in (template_local_path, signature_local_path):
+                if temp_path:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
 
 
 def _slugify(value: str | None) -> str:
