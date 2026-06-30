@@ -1,13 +1,14 @@
 import io
 import re
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime, date
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -26,7 +27,7 @@ from app.models.models import (
 from app.schemas.schemas import CertificateOut, CertificateRevokeRequest
 from app.services.audit import record
 from app.services.certificate_job import generate_pending_certificates, render_certificate_for_enrollment
-from app.services.storage import resolve_storage_path
+from app.services.storage import resolve_storage_path, get_storage
 
 router = APIRouter(prefix="/certificates", tags=["certificates"])
 
@@ -106,11 +107,18 @@ def download_certificate(certificate_id: str, db: Session = Depends(get_db), use
     cert = db.query(Certificate).filter(Certificate.id == certificate_id).first()
     if not cert or not cert.pdf_path:
         raise HTTPException(status_code=404, detail="Certificate PDF not available")
-    full_path = resolve_storage_path(cert.pdf_path)
-    if not full_path.exists():
+
+    storage = get_storage()
+    if not storage.exists(cert.pdf_path):
         raise HTTPException(status_code=404, detail="Certificate file missing on storage")
+
+    data = storage.get(cert.pdf_path)
     filename = build_certificate_download_filename(cert)
-    return FileResponse(full_path, media_type="application/pdf", filename=filename)
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/download-bulk")
@@ -145,16 +153,17 @@ def download_certificates_zip(
     if not certificates:
         raise HTTPException(status_code=404, detail="No certificates found")
 
+    storage = get_storage()
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for cert in certificates:
             if not cert.pdf_path:
                 continue
-            full_path = resolve_storage_path(cert.pdf_path)
-            if not full_path.exists():
+            if not storage.exists(cert.pdf_path):
                 continue
+            data = storage.get(cert.pdf_path)
             filename = build_certificate_download_filename(cert)
-            zf.write(full_path, arcname=filename)
+            zf.writestr(filename, data)
 
     buffer.seek(0)
     return StreamingResponse(
@@ -204,10 +213,15 @@ def upload_template(
     db: Session = Depends(get_db),
     user: User = Depends(require_super_admin),
 ):
-    relative_path = f"templates/{file.filename}"
-    full_path = resolve_storage_path(relative_path)
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_bytes(file.file.read())
+    ext = Path(file.filename).suffix or ".png"
+    relative_path = f"templates/{uuid.uuid4()}{ext}"
+
+    storage = get_storage()
+    data = file.file.read()
+    storage.save(relative_path, data)
+
+    if not storage.exists(relative_path):
+        raise HTTPException(status_code=500, detail="Template upload failed to persist to storage")
 
     template = CertificateTemplate(name=name, file_path=relative_path, is_active=False)
     db.add(template)
@@ -249,10 +263,15 @@ def upload_signature(
     db: Session = Depends(get_db),
     user: User = Depends(require_super_admin),
 ):
-    relative_path = f"signatures/{file.filename}"
-    full_path = resolve_storage_path(relative_path)
-    full_path.parent.mkdir(parents=True, exist_ok=True)
-    full_path.write_bytes(file.file.read())
+    ext = Path(file.filename).suffix or ".png"
+    relative_path = f"signatures/{uuid.uuid4()}{ext}"
+
+    storage = get_storage()
+    data = file.file.read()
+    storage.save(relative_path, data)
+
+    if not storage.exists(relative_path):
+        raise HTTPException(status_code=500, detail="Signature upload failed to persist to storage")
 
     db.query(Signature).update({Signature.is_active: False})
     signature = Signature(label=label, image_path=relative_path, is_active=True)
@@ -266,32 +285,4 @@ def upload_signature(
 def list_signatures(db: Session = Depends(get_db), user: User = Depends(require_super_admin)):
     signatures = db.query(Signature).order_by(Signature.created_at.desc()).all()
     return [
-        {"id": s.id, "label": s.label, "is_active": s.is_active, "image_path": s.image_path}
-        for s in signatures
-    ]
-
-
-@router.get("/signature/{signature_id}/preview")
-def preview_signature(signature_id: str, db: Session = Depends(get_db), user: User = Depends(require_super_admin)):
-    signature = db.query(Signature).filter(Signature.id == signature_id).first()
-    if not signature:
-        raise HTTPException(status_code=404, detail="Signature not found")
-    full_path = resolve_storage_path(signature.image_path)
-    if not full_path.exists():
-        raise HTTPException(status_code=404, detail="Signature file missing on storage")
-    return FileResponse(full_path)
-
-
-@router.post("/signature/{signature_id}/activate")
-def activate_signature(signature_id: str, db: Session = Depends(get_db), user: User = Depends(require_super_admin)):
-    """Activates a previously-uploaded signature without re-uploading it.
-    Only one signature is ever active at a time — every future certificate
-    uses whichever one is active when it's generated."""
-    signature = db.query(Signature).filter(Signature.id == signature_id).first()
-    if not signature:
-        raise HTTPException(status_code=404, detail="Signature not found")
-    db.query(Signature).update({Signature.is_active: False})
-    signature.is_active = True
-    db.commit()
-    record(db, user.id, "SIGNATURE_ACTIVATED", "Signature", signature.id)
-    return {"message": "Signature activated"}
+        {"id": s.id, "label": s.label, "is_active": s.is_active,
