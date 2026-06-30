@@ -2,8 +2,8 @@
 Storage abstraction. Defaults to local disk; switches to S3 / Cloudflare R2
 / Backblaze B2 when STORAGE_BACKEND is set to "s3" or "r2" (all are S3-compatible).
 """
+import tempfile
 from pathlib import Path
-
 from app.core.config import settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -13,7 +13,6 @@ def resolve_storage_path(relative_path: str | Path) -> Path:
     path = Path(relative_path)
     if path.is_absolute():
         return path
-
     base_path = Path(settings.LOCAL_STORAGE_PATH)
     if not base_path.is_absolute():
         base_path = PROJECT_ROOT / base_path
@@ -43,7 +42,6 @@ class LocalStorage:
 class S3Storage:
     def __init__(self):
         import boto3
-
         self.client = boto3.client(
             "s3",
             endpoint_url=settings.S3_ENDPOINT_URL or None,
@@ -78,3 +76,18 @@ def get_storage():
     if settings.STORAGE_BACKEND in ("s3", "r2"):
         return S3Storage()
     return LocalStorage()
+
+
+def save_to_local_temp(relative_path: str, suffix: str = "") -> str:
+    """
+    Downloads a file from storage (S3/B2/local) into a local temp file
+    and returns the temp file path. Used by ReportLab and QR engine
+    which need a real local filesystem path, not bytes.
+    Caller is responsible for deleting the temp file when done.
+    """
+    storage = get_storage()
+    data = storage.get(relative_path)
+    ext = suffix or Path(relative_path).suffix or ".tmp"
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(data)
+        return tmp.name
