@@ -4,6 +4,7 @@ Storage abstraction. Defaults to local disk; switches to S3 / Cloudflare R2
 """
 import tempfile
 from pathlib import Path
+
 from app.core.config import settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -86,8 +87,20 @@ def save_to_local_temp(relative_path: str, suffix: str = "") -> str:
     Caller is responsible for deleting the temp file when done.
     """
     storage = get_storage()
+
+    # For local storage, the file already exists on disk — return the
+    # real path directly so callers don't delete the original file.
+    if isinstance(storage, LocalStorage):
+        full_path = resolve_storage_path(relative_path)
+        if full_path.exists():
+            return str(full_path)
+
     data = storage.get(relative_path)
     ext = suffix or Path(relative_path).suffix or ".tmp"
     with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
         tmp.write(data)
         return tmp.name
+
+
+# Alias — certificate_job.py imports this name
+resolve_to_local_temp = save_to_local_temp
