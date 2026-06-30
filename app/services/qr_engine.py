@@ -3,14 +3,16 @@ QR code generation. Every certificate gets exactly one QR code encoding the
 public verification URL.
 """
 import io
+import tempfile
+
 import qrcode
+
 from app.core.config import settings
-from app.services.storage import get_storage, save_to_local_temp
+from app.services.storage import get_storage
 
 
 def generate_qr_for_certificate(certificate_id: str) -> tuple[str, str]:
     """Generates a QR PNG for a certificate.
-
     Returns (local_render_path, storage_relative_path):
       - local_render_path: an actual file on local disk, suitable for
         ReportLab's ImageReader during PDF rendering. ALWAYS exists,
@@ -36,10 +38,15 @@ def generate_qr_for_certificate(certificate_id: str) -> tuple[str, str]:
     data = buffer.getvalue()
 
     relative_path = f"qrcodes/{certificate_id}.png"
+
+    # Upload to durable storage (S3/B2/local)
     storage = get_storage()
     storage.save(relative_path, data)
 
-    # Always produce a real local file for rendering, independent of backend.
-    local_render_path = save_to_local_temp(data, suffix=".png")
+    # Always write to a real local temp file for ReportLab rendering —
+    # ReportLab's ImageReader needs an actual filesystem path, not bytes.
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+        tmp.write(data)
+        local_render_path = tmp.name
 
     return local_render_path, relative_path
