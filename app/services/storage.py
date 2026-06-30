@@ -1,7 +1,6 @@
 """
 Storage abstraction. Defaults to local disk; switches to S3 / Cloudflare R2
 when STORAGE_BACKEND is set to "s3" or "r2" (R2 is just S3-compatible).
-
 IMPORTANT: rendering code (ReportLab, qrcode/PIL) needs a real local file
 handle to write to / read from — it can't write straight to S3. So every
 storage backend supports `save(relative_path, data)` which takes bytes,
@@ -10,7 +9,6 @@ backend is remote. Callers never need to special-case the backend.
 """
 from pathlib import Path
 import tempfile
-
 from app.core.config import settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -38,6 +36,9 @@ class LocalStorage:
         full_path.write_bytes(data)
         return relative_path
 
+    def get(self, relative_path: str) -> bytes:
+        return resolve_storage_path(relative_path).read_bytes()
+
     def local_path_for(self, relative_path: str) -> str:
         """Path usable for rendering libs that need a real file handle."""
         return str(resolve_storage_path(relative_path))
@@ -61,6 +62,11 @@ class S3Storage:
     def save(self, relative_path: str, data: bytes) -> str:
         self.client.put_object(Bucket=self.bucket, Key=relative_path, Body=data)
         return relative_path
+
+    def get(self, relative_path: str) -> bytes:
+        """Downloads and returns the object's bytes from S3/R2."""
+        obj = self.client.get_object(Bucket=self.bucket, Key=relative_path)
+        return obj["Body"].read()
 
     def local_path_for(self, relative_path: str) -> str:
         """S3-backed storage has no durable local file — callers that need
@@ -100,3 +106,23 @@ def save_to_local_temp(data: bytes, suffix: str = "") -> str:
     finally:
         tmp.close()
     return tmp.name
+
+
+def resolve_to_local_temp(relative_path: str, suffix: str = "") -> str:
+    """Returns a LOCAL filesystem path that is guaranteed to actually exist
+    and contain the file's current bytes, regardless of storage backend.
+
+    For LocalStorage this is just the real path on disk (no copy needed).
+    For S3Storage this downloads the object's bytes into a fresh local
+    temp file and returns that path.
+
+    Callers should check `is_temp_path` (returned alongside, see
+    resolve_to_local_temp_with_flag) if they need to know whether to
+    delete the file afterward. This simple version is for callers that
+    don't need that distinction immediately."""
+    storage = get_storage()
+    if isinstance(storage, LocalStorage):
+        return storage.local_path_for(relative_path)
+    data = storage.get(relative_path)
+    suffix = suffix or Path(relative_path).suffix
+    return save_to_local_temp(data, suffix=suffix)
