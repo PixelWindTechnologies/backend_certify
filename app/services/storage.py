@@ -15,9 +15,15 @@ Nothing here assumes a remote file is also on local disk.
 import tempfile
 from pathlib import Path
 
+from botocore.config import Config
 from app.core.config import settings
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+# How long to wait when connecting to or reading from S3/R2.
+# Without these, boto3 can hang indefinitely on a slow/unreachable endpoint.
+S3_CONNECT_TIMEOUT = 10
+S3_READ_TIMEOUT = 30
 
 
 def resolve_storage_path(relative_path: str | Path) -> Path:
@@ -75,6 +81,11 @@ class S3Storage:
             aws_access_key_id=settings.S3_ACCESS_KEY,
             aws_secret_access_key=settings.S3_SECRET_KEY,
             region_name=settings.S3_REGION,
+            config=Config(
+                connect_timeout=S3_CONNECT_TIMEOUT,
+                read_timeout=S3_READ_TIMEOUT,
+                retries={"max_attempts": 2, "mode": "standard"},
+            ),
         )
         self.bucket = settings.S3_BUCKET
 
