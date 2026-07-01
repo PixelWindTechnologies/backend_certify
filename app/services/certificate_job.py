@@ -1,32 +1,10 @@
 """
 Scheduled job that auto-generates certificates for every enrollment that's
-eligible and doesn't yet have a certificate. Wired up via APScheduler in
-app/main.py, and can also be invoked manually / via a cron container for
-a "serverless" deployment style.
+eligible and doesn't yet have a certificate.
 
-An enrollment is eligible once Certificate Approval = Approved, and
-either:
-  - Status is explicitly Completed, or
-  - Status isn't Dropped and the relieving date has already passed.
-
-That second path exists because requiring every single enrollment to be
-flipped to "Completed" by hand doesn't scale for bulk-imported students —
-once their relieving date (set via Excel or the Enrollments page) is in
-the past and nobody's marked them Dropped, the internship is over in
-practice. When this path fires, the enrollment's status is also updated
-to Completed so the Enrollments page reflects reality.
-
-`render_certificate_for_enrollment` is shared with the certificate preview
-endpoint so "preview" and "generate" always produce an identical document —
-the only difference is whether a Certificate row gets persisted.
-
-Storage note: ReportLab/PIL need real local file handles to render from
-(background template, signature image, QR code) and to render TO (the
-output PDF). So every render happens on local disk first; remote upload
-(S3/R2) is a separate, explicit step afterward. The background template
-and signature image are fetched to a guaranteed-real local temp file via
-resolve_to_local_temp() — they are NOT assumed to already exist on local
-disk just because resolve_storage_path() can compute a path for them.
+Storage note: ReportLab/PIL need real local file handles. Every asset
+(template background, signature, QR code) is fetched to a local temp file
+before rendering, then the finished PDF is uploaded to durable storage.
 """
 import os
 import re
@@ -49,22 +27,10 @@ from app.models.models import (
 from app.services.certificate_engine import render_certificate_pdf
 from app.services.email_service import send_certificate_ready_email, send_certificate_generation_failure_alert
 from app.services.qr_engine import generate_qr_for_certificate
-from app.services.storage import (
-    get_storage,
-    resolve_storage_path,
-    resolve_to_local_temp,
-    LocalStorage,
-)
+from app.services.storage import get_storage, resolve_storage_path, save_to_local_temp
 
 
 def finalize_enrollment_if_eligible(db: Session, enrollment: Enrollment) -> bool:
-    """Finalize an enrollment when it has become eligible for certificate issuance.
-
-    Eligibility is reached when the enrollment is already marked Completed or its
-    relieving date has arrived. In either case, the record is moved to the
-    completed state and approved for certificate issuance automatically so the
-    manual approval step is no longer required for routine cases.
-    """
     if enrollment.status == EnrollmentStatus.DROPPED:
         return False
 
@@ -86,11 +52,12 @@ def finalize_enrollment_if_eligible(db: Session, enrollment: Enrollment) -> bool
 def render_certificate_for_enrollment(
     db: Session, enrollment: Enrollment, output_path: str, certificate_id: str, issue_date: str
 ) -> str:
-    """Renders a certificate PDF for the given enrollment to output_path
-    (a LOCAL filesystem path) using whatever template/signature is
-    currently active. Does not touch the database, and does not upload
-    anything to remote storage — the caller decides whether/how to
-    persist a Certificate row and whether to upload the resulting PDF."""
+    """Renders a certificate PDF to output_path (a local filesystem path).
+    Fetches all assets (template, signature, QR) to local temp files first
+    so ReportLab can read them regardless of storage backend.
+    Does not upload anything — caller handles persistence."""
+    storage = get_storage()
+
     template = db.query(CertificateTemplate).filter(CertificateTemplate.is_active.is_(True)).first()
     signature = db.query(Signature).filter(Signature.is_active.is_(True)).first()
 
@@ -98,19 +65,32 @@ def render_certificate_for_enrollment(
     course = enrollment.course
     college = enrollment.college
 
-    # qr_local_path is a guaranteed-real local file for rendering, regardless
-    # of storage backend; qr_relative_path is the durable storage key.
-    qr_local_path, qr_relative_path = generate_qr_for_certificate(certificate_id)
-
-    # Same treatment as the QR code: fetch the template/signature to a
-    # guaranteed-real local path. For LocalStorage this is just the real
-    # file already on disk. For S3/R2 this downloads the bytes to a fresh
-    # local temp file, since resolve_storage_path() alone only computes a
-    # path string and does NOT guarantee the file exists locally.
-    template_local_path = resolve_to_local_temp(template.file_path) if template else None
-    signature_local_path = resolve_to_local_temp(signature.image_path) if signature else None
+    # Track temp files to clean up after rendering
+    temp_files = []
 
     try:
+        # --- QR code: generate, upload, and get a local render path ---
+        qr_local_path, _qr_storage_key = generate_qr_for_certificate(certificate_id)
+        temp_files.append(qr_local_path)
+
+        # --- Template background: fetch from storage to a local temp file ---
+        template_local_path = None
+        if template and template.file_path:
+            suffix = Path(template.file_path).suffix or ".png"
+            template_local_path = storage.fetch_to_temp(template.file_path, suffix=suffix)
+            # Only add to cleanup if it's actually a temp file (S3 backend),
+            # not the real local file (LocalStorage.fetch_to_temp returns real path)
+            if settings.STORAGE_BACKEND in ("s3", "r2"):
+                temp_files.append(template_local_path)
+
+        # --- Signature: fetch from storage to a local temp file ---
+        signature_local_path = None
+        if signature and signature.image_path:
+            suffix = Path(signature.image_path).suffix or ".png"
+            signature_local_path = storage.fetch_to_temp(signature.image_path, suffix=suffix)
+            if settings.STORAGE_BACKEND in ("s3", "r2"):
+                temp_files.append(signature_local_path)
+
         return render_certificate_pdf(
             output_path=output_path,
             student_name=student.full_name,
@@ -131,25 +111,11 @@ def render_certificate_for_enrollment(
             qr_code_path=qr_local_path,
         )
     finally:
-        # qr_local_path is always a temp file (see qr_engine.save_to_local_temp);
-        # clean it up now that rendering has read from it.
-        try:
-            os.unlink(qr_local_path)
-        except OSError:
-            pass
-
-        # Only clean up template/signature local paths if storage is remote.
-        # For LocalStorage, template_local_path/signature_local_path point
-        # at the REAL stored files — deleting them would destroy the
-        # original template/signature, not just a temp copy.
-        storage = get_storage()
-        if not isinstance(storage, LocalStorage):
-            for temp_path in (template_local_path, signature_local_path):
-                if temp_path:
-                    try:
-                        os.unlink(temp_path)
-                    except OSError:
-                        pass
+        for path in temp_files:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 def _slugify(value: str | None) -> str:
@@ -159,17 +125,7 @@ def _slugify(value: str | None) -> str:
     return slug or "student"
 
 
-def _persist_pdf(pdf_local_path: str, pdf_relative_path: str) -> None:
-    """Uploads the rendered PDF to durable storage. For LocalStorage this
-    is a no-op re-write of the same bytes to the same place; for S3Storage
-    this is the upload that was previously missing entirely."""
-    storage = get_storage()
-    data = Path(pdf_local_path).read_bytes()
-    storage.save(pdf_relative_path, data)
-
-
 def generate_pending_certificates() -> int:
-    """Generate certificates for all eligible enrollments that do not yet have a certificate."""
     db = SessionLocal()
     generated = 0
     try:
@@ -203,25 +159,27 @@ def generate_pending_certificates() -> int:
                 student_name = _slugify(enrollment.student.full_name) if enrollment.student else "student"
                 pdf_relative_path = f"certificates/{student_name}-{certificate.id}.pdf"
 
-                # Render to a LOCAL path always (ReportLab can't write to S3
-                # directly). resolve_storage_path() against LOCAL_STORAGE_PATH
-                # is fine here purely as a local working/output directory —
-                # it is not assumed to be durable storage when STORAGE_BACKEND
-                # is s3/r2; _persist_pdf() below handles the actual upload.
-                pdf_local_path = str(resolve_storage_path(pdf_relative_path))
+                # Render to a local temp file first (ReportLab can't write to S3)
+                with __import__('tempfile').NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                    pdf_local_path = tmp.name
 
-                render_certificate_for_enrollment(
-                    db,
-                    enrollment,
-                    pdf_local_path,
-                    certificate.id,
-                    certificate.issue_date.isoformat(),
-                )
+                try:
+                    render_certificate_for_enrollment(
+                        db,
+                        enrollment,
+                        pdf_local_path,
+                        certificate.id,
+                        certificate.issue_date.isoformat(),
+                    )
 
-                # Explicitly persist the rendered PDF to durable storage.
-                # Previously missing for the s3/r2 backends — the PDF only
-                # ever existed on local (ephemeral) disk.
-                _persist_pdf(pdf_local_path, pdf_relative_path)
+                    # Upload the rendered PDF to durable storage
+                    storage = get_storage()
+                    storage.save(pdf_relative_path, Path(pdf_local_path).read_bytes())
+                finally:
+                    try:
+                        os.unlink(pdf_local_path)
+                    except OSError:
+                        pass
 
                 certificate.pdf_path = pdf_relative_path
                 certificate.template_id = template.id if template else None
