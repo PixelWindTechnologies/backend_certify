@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # abandoned. Set to 5 minutes — generous enough for a large batch,
 # but short enough to release the lock before the next 2-minute tick
 # stacks up too many skips.
-JOB_TIMEOUT_SECONDS = 300
+JOB_TIMEOUT_SECONDS = 30
 
 
 def generate_pending_certificates_with_timeout():
