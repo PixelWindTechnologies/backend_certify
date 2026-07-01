@@ -4,6 +4,8 @@ from typing import Iterable
 
 from app.core.config import settings
 
+SMTP_TIMEOUT_SECONDS = 10
+
 
 def _normalize_recipients(recipients: Iterable[str] | None) -> list[str]:
     if not recipients:
@@ -27,7 +29,7 @@ def send_mail(subject: str, body: str, to_email: str | None, html_body: str | No
         if html_body:
             message.add_alternative(html_body, subtype="html")
 
-        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT or 587) as smtp:
+        with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT or 587, timeout=SMTP_TIMEOUT_SECONDS) as smtp:
             if settings.SMTP_USERNAME and settings.SMTP_PASSWORD:
                 smtp.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
             smtp.send_message(message)
