@@ -1,11 +1,10 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.executors.pool import ThreadPoolExecutor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-
 from app.api.routes import (
     auth,
     colleges,
@@ -20,7 +19,14 @@ from app.api.routes import (
 from app.core.config import settings
 from app.services.certificate_job import generate_pending_certificates
 
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(
+    executors={"default": ThreadPoolExecutor(1)},
+    job_defaults={
+        "max_instances": 1,
+        "misfire_grace_time": 60,
+        "coalesce": True,
+    },
+)
 
 
 @asynccontextmanager
@@ -30,8 +36,11 @@ async def lifespan(app: FastAPI):
         generate_pending_certificates,
         "interval",
         seconds=settings.CERTIFICATE_JOB_INTERVAL_SECONDS,
-        id="certificate_generation_job",
+        id="generate_pending_certificates",
         replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
     )
     scheduler.start()
     yield
