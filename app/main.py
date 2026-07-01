@@ -24,30 +24,31 @@ from app.services.certificate_job import generate_pending_certificates
 
 logger = logging.getLogger(__name__)
 
-# How long the certificate job is allowed to run before being forcibly
-# abandoned. Set to 5 minutes — generous enough for a large batch,
-# but short enough to release the lock before the next 2-minute tick
-# stacks up too many skips.
 JOB_TIMEOUT_SECONDS = 30
 
 
 def generate_pending_certificates_with_timeout():
-    """Wrapper that runs generate_pending_certificates in a separate thread
-    with a hard timeout. If the job hangs (e.g. S3 fetch stalls, DB query
-    never returns), it will be abandoned after JOB_TIMEOUT_SECONDS and the
-    APScheduler lock will be released so the next tick can run cleanly."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(generate_pending_certificates)
-        try:
-            result = future.result(timeout=JOB_TIMEOUT_SECONDS)
-            logger.info(f"Certificate job completed: {result} certificates generated.")
-        except concurrent.futures.TimeoutError:
-            logger.error(
-                f"Certificate job timed out after {JOB_TIMEOUT_SECONDS}s and was abandoned. "
-                "Check for slow S3 fetches, hanging DB queries, or large batches."
-            )
-        except Exception as exc:
-            logger.error(f"Certificate job failed with exception: {exc}", exc_info=True)
+    """Runs generate_pending_certificates in a separate thread with a hard
+    timeout. Uses shutdown(wait=False) so the wrapper returns immediately
+    when the timeout fires — the APScheduler lock is released and the next
+    tick can run cleanly even if the inner thread is still winding down."""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(generate_pending_certificates)
+    try:
+        result = future.result(timeout=JOB_TIMEOUT_SECONDS)
+        logger.info(f"Certificate job completed: {result} certificates generated.")
+    except concurrent.futures.TimeoutError:
+        logger.error(
+            f"Certificate job timed out after {JOB_TIMEOUT_SECONDS}s and was abandoned. "
+            "Check for slow S3 fetches, hanging DB queries, or large batches."
+        )
+    except Exception as exc:
+        logger.error(f"Certificate job failed with exception: {exc}", exc_info=True)
+    finally:
+        # wait=False means we don't block here — the inner thread is abandoned
+        # and will eventually die on its own. This is intentional: we want the
+        # wrapper to return promptly so APScheduler releases the job lock.
+        executor.shutdown(wait=False)
 
 
 scheduler = BackgroundScheduler(
