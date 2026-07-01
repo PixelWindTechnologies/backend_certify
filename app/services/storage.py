@@ -1,6 +1,16 @@
 """
 Storage abstraction. Defaults to local disk; switches to S3 / Cloudflare R2
-/ Backblaze B2 when STORAGE_BACKEND is set to "s3" or "r2" (all are S3-compatible).
+when STORAGE_BACKEND is set to "s3" or "r2" (R2 is just S3-compatible).
+
+IMPORTANT: rendering code (ReportLab, qrcode/PIL) needs real local file
+handles. So every backend exposes:
+  - save(relative_path, data)      → upload/write bytes
+  - exists(relative_path)          → check if the object exists
+  - get(relative_path)             → return bytes
+  - fetch_to_temp(relative_path)   → write to a local temp file and return
+                                     its path (caller must os.unlink() after)
+
+Nothing here assumes a remote file is also on local disk.
 """
 import tempfile
 from pathlib import Path
@@ -11,6 +21,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def resolve_storage_path(relative_path: str | Path) -> Path:
+    """Resolve a relative_path to a LOCAL filesystem path.
+    Only meaningful for LocalStorage. Do NOT use this as a renderable path
+    when STORAGE_BACKEND is s3/r2 — use storage.fetch_to_temp() instead."""
     path = Path(relative_path)
     if path.is_absolute():
         return path
@@ -20,21 +33,34 @@ def resolve_storage_path(relative_path: str | Path) -> Path:
     return base_path / path
 
 
+def save_to_local_temp(data: bytes, suffix: str = "") -> str:
+    """Write bytes to a temp file and return its absolute path.
+    The caller is responsible for deleting it after use (os.unlink)."""
+    tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+    try:
+        tmp.write(data)
+    finally:
+        tmp.close()
+    return tmp.name
+
+
 class LocalStorage:
     def save(self, relative_path: str, data: bytes) -> str:
         full_path = resolve_storage_path(relative_path)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_bytes(data)
-        return str(full_path)
-
-    def get(self, relative_path: str) -> bytes:
-        full_path = resolve_storage_path(relative_path)
-        if not full_path.exists():
-            raise FileNotFoundError(f"{relative_path} not found in local storage")
-        return full_path.read_bytes()
+        return relative_path
 
     def exists(self, relative_path: str) -> bool:
         return resolve_storage_path(relative_path).exists()
+
+    def get(self, relative_path: str) -> bytes:
+        return resolve_storage_path(relative_path).read_bytes()
+
+    def fetch_to_temp(self, relative_path: str, suffix: str = "") -> str:
+        """For LocalStorage, the file is already on disk — just return its path.
+        Caller should NOT delete this path (it's the real file, not a temp copy)."""
+        return str(resolve_storage_path(relative_path))
 
     def url_for(self, relative_path: str) -> str:
         return f"/files/{relative_path}"
@@ -56,51 +82,35 @@ class S3Storage:
         self.client.put_object(Bucket=self.bucket, Key=relative_path, Body=data)
         return relative_path
 
-    def get(self, relative_path: str) -> bytes:
-        response = self.client.get_object(Bucket=self.bucket, Key=relative_path)
-        return response["Body"].read()
-
     def exists(self, relative_path: str) -> bool:
         try:
             self.client.head_object(Bucket=self.bucket, Key=relative_path)
             return True
+        except self.client.exceptions.ClientError:
+            return False
         except Exception:
             return False
 
+    def get(self, relative_path: str) -> bytes:
+        response = self.client.get_object(Bucket=self.bucket, Key=relative_path)
+        return response["Body"].read()
+
+    def fetch_to_temp(self, relative_path: str, suffix: str = "") -> str:
+        """Download from S3 into a local temp file. Returns the local path.
+        Caller MUST os.unlink() this path after use."""
+        data = self.get(relative_path)
+        return save_to_local_temp(data, suffix=suffix)
+
     def url_for(self, relative_path: str) -> str:
         if settings.S3_PUBLIC_URL:
-            return f"{settings.S3_PUBLIC_URL}/{relative_path}"
-        return f"{settings.S3_ENDPOINT_URL}/{self.bucket}/{relative_path}"
+            public_base = settings.S3_PUBLIC_URL.rstrip("/")
+            return f"{public_base}/{relative_path.lstrip('/')}"
+        if settings.S3_ENDPOINT_URL:
+            return f"{settings.S3_ENDPOINT_URL.rstrip('/')}/{self.bucket}/{relative_path.lstrip('/')}"
+        return f"/{relative_path.lstrip('/')}"
 
 
 def get_storage():
     if settings.STORAGE_BACKEND in ("s3", "r2"):
         return S3Storage()
     return LocalStorage()
-
-
-def save_to_local_temp(relative_path: str, suffix: str = "") -> str:
-    """
-    Downloads a file from storage (S3/B2/local) into a local temp file
-    and returns the temp file path. Used by ReportLab and QR engine
-    which need a real local filesystem path, not bytes.
-    Caller is responsible for deleting the temp file when done.
-    """
-    storage = get_storage()
-
-    # For local storage, the file already exists on disk — return the
-    # real path directly so callers don't delete the original file.
-    if isinstance(storage, LocalStorage):
-        full_path = resolve_storage_path(relative_path)
-        if full_path.exists():
-            return str(full_path)
-
-    data = storage.get(relative_path)
-    ext = suffix or Path(relative_path).suffix or ".tmp"
-    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-        tmp.write(data)
-        return tmp.name
-
-
-# Alias — certificate_job.py imports this name
-resolve_to_local_temp = save_to_local_temp
